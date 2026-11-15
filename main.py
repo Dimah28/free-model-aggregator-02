@@ -9,7 +9,8 @@ grader's gateway at $OPENAI_BASE_URL/chat/completions.
 
 Routing: free models that meet the prompt's requirements, ordered by the
 house rating (highest first, id ascending as tie-break), with failover to
-the next candidate when the gateway refuses a call. Refusals are reported
+the next candidate when the gateway refuses a call. A refused model sits
+out the next prompt only, then returns to the ranking. Refusals are reported
 on the x-makefun-upstream-failures header so the failover column can see
 a refusal that was recovered from.
 
@@ -141,9 +142,13 @@ PROMPTS = [p for p in _RAW_PROMPTS if isinstance(p, dict)]
 CATALOG = _build_catalog(_RAW_MODELS)
 CATALOG_JSON = json.dumps(CATALOG, separators=(",", ":"))
 
-# Trial-local memory: models the gateway refused in this trial.
-_REJECTED = set()
-_REJECTED_LOCK = threading.Lock()
+# Trial-local probation: model id -> earliest prompt ordinal at which the
+# model may be tried again. A model the gateway refuses on prompt k is
+# skipped only for prompt k+1, then it is eligible again by rating order;
+# a fresh refusal restarts the probation. Count-based, never wall clock,
+# so a replay sees the same decisions.
+_PROBATION = {}
+_PROBATION_LOCK = threading.Lock()
 
 # Arrival order of completion requests, shared by both wires.
 _PROMPT_INDEX = 0
@@ -289,8 +294,14 @@ def _dial_once(chat_body, model_id, stream, timeout):
         return None, (0, str(exc).encode("utf-8", "replace"))
 
 
-def _dial_with_failover(chat_body, stream, requires):
+def _dial_with_failover(chat_body, stream, requires, index):
     """Try candidates in order (max 5, 28 s per prompt).
+
+    `index` is the arrival ordinal of this prompt. A model the gateway
+    refused on prompt k is skipped only for prompt k+1 (probation), then
+    eligible again by rating order; a fresh refusal restarts it. Within
+    one prompt a refused model is never retried: the loop moves on to
+    the next candidate.
 
     Non-streaming: returns {"model", "body", "failures"} with the parsed
     upstream body. Streaming: returns {"model", "resp", "failures"} with
@@ -298,9 +309,10 @@ def _dial_with_failover(chat_body, stream, requires):
     """
     deadline = time.monotonic() + 28.0
     ranked = _candidates(requires)
-    with _REJECTED_LOCK:
-        rejected = set(_REJECTED)
-    ordered = [m for m in ranked if m["id"] not in rejected] or list(ranked)
+    with _PROBATION_LOCK:
+        probation = dict(_PROBATION)
+    ordered = ([m for m in ranked if index >= probation.get(m["id"], 0)]
+               or list(ranked))
     failures = []
     last_summary = "no candidate model"
     unreachable = False
@@ -336,8 +348,8 @@ def _dial_with_failover(chat_body, stream, requires):
             last_summary = "gateway unreachable"
         else:
             failures.append(_failure_row(status, raw, model["id"]))
-            with _REJECTED_LOCK:
-                _REJECTED.add(model["id"])
+            with _PROBATION_LOCK:
+                _PROBATION[model["id"]] = index + 2
             last_summary = "HTTP %d: %s" % (status, raw.decode("utf-8", "replace")[:500])
     return {
         "model": None,
@@ -752,7 +764,7 @@ class _Handler(BaseHTTPRequestHandler):
         if requires is None:
             requires = _requires_from_body(body, "openai")
         stream = bool(body.get("stream"))
-        result = _dial_with_failover(body, stream, requires)
+        result = _dial_with_failover(body, stream, requires, index)
         if result.get("model") is None:
             self._serve_failure("openai", result)
             return
@@ -779,7 +791,7 @@ class _Handler(BaseHTTPRequestHandler):
             requires = _requires_from_body(body, "anthropic")
         stream = bool(body.get("stream"))
         chat = _anthropic_to_chat(body)
-        result = _dial_with_failover(chat, stream, requires)
+        result = _dial_with_failover(chat, stream, requires, index)
         if result.get("model") is None:
             self._serve_failure("anthropic", result)
             return
